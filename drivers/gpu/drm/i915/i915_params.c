@@ -35,6 +35,8 @@ struct i915_params i915 __read_mostly = {
 	.enable_fbc = -1,
 	.enable_execlists = -1,
 	.enable_hangcheck = true,
+	.enable_engine_reset = false,
+	.gpu_reset_promotion_time = 10,
 	.enable_ppgtt = -1,
 	.enable_psr = 0,
 	.preliminary_hw_support = IS_ENABLED(CONFIG_DRM_I915_PRELIMINARY_HW_SUPPORT),
@@ -107,6 +109,23 @@ MODULE_PARM_DESC(enable_hangcheck,
 	"Periodically check GPU activity for detecting hangs. "
 	"WARNING: Disabling this can cause system wide hangs. "
 	"(default: true)");
+
+module_param_named_unsafe(enable_engine_reset, i915.enable_engine_reset, bool, 0644);
+MODULE_PARM_DESC(enable_engine_reset,
+	"Enable GPU engine hang recovery mode. Used as a soft, low-impact form "
+	"of hang recovery that targets individual GPU engines rather than the "
+	"entire GPU"
+	"(default: false)");
+
+module_param_named(gpu_reset_promotion_time,
+               i915.gpu_reset_promotion_time, int, 0644);
+MODULE_PARM_DESC(gpu_reset_promotion_time,
+               "Catch excessive engine resets. Each engine maintains a "
+	       "timestamp of the last time it was reset. If it hangs again "
+	       "within this period then fall back to full GPU reset to try and"
+	       " recover from the hang. Only applicable if enable_engine_reset "
+	       "is enabled."
+               "default=10 seconds");
 
 module_param_named_unsafe(enable_ppgtt, i915.enable_ppgtt, int, 0400);
 MODULE_PARM_DESC(enable_ppgtt,

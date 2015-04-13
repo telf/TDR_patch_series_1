@@ -49,6 +49,22 @@ struct  intel_hw_status_page {
 #define I915_READ_MODE(ring) I915_READ(RING_MI_MODE((ring)->mmio_base))
 #define I915_WRITE_MODE(ring, val) I915_WRITE(RING_MI_MODE((ring)->mmio_base), val)
 
+
+#define I915_READ_TAIL_CTX(engine, ctx, outval) \
+	intel_execlists_read_tail((engine), \
+				(ctx), \
+				&(outval));
+
+#define I915_READ_HEAD_CTX(engine, ctx, outval) \
+	intel_execlists_read_head((engine), \
+				(ctx), \
+				&(outval));
+
+#define I915_WRITE_HEAD_CTX(engine, ctx, val) \
+	intel_execlists_write_head((engine), \
+				(ctx), \
+				(val));
+
 /* seqno size is actually only a uint32, but since we plan to use MI_FLUSH_DW to
  * do the writes, and that must have qw aligned offsets, simply pretend it's 8b.
  */
@@ -93,6 +109,34 @@ struct intel_ring_hangcheck {
 	int score;
 	enum intel_ring_hangcheck_action action;
 	int deadlock;
+
+	/*
+	 * Last recorded ring head index.
+	 * This is only ever a ring index where as active
+	 * head may be a graphics address in a ring buffer
+	 */
+	u32 last_head;
+
+	/* Flag to indicate if engine reset required */
+	atomic_t flags;
+
+	/* Indicates request to reset this engine */
+#define I915_ENGINE_RESET_IN_PROGRESS (1<<0)
+
+	/*
+	 * Timestamp (seconds) from when the last time
+	 * this engine was reset.
+	 */
+	u32 last_engine_reset_time;
+
+	/*
+	 * Number of times this engine has been
+	 * reset since boot
+	 */
+	u32 reset_count;
+
+	/* Number of TDR hang detections */
+	u32 tdr_count;
 };
 
 struct intel_ringbuffer {
@@ -202,6 +246,14 @@ struct  intel_engine_cs {
 #define I915_DISPATCH_RS     0x4
 	void		(*cleanup)(struct intel_engine_cs *ring);
 
+	int (*enable)(struct intel_engine_cs *ring);
+	int (*disable)(struct intel_engine_cs *ring);
+	int (*save)(struct intel_engine_cs *ring,
+		    struct drm_i915_gem_request *req,
+		    bool force_advance);
+	int (*restore)(struct intel_engine_cs *ring,
+		       struct drm_i915_gem_request *req);
+
 	/* GEN8 signal/wait table - never trust comments!
 	 *	  signal to	signal to    signal to   signal to      signal to
 	 *	    RCS		   VCS          BCS        VECS		 VCS2
@@ -307,6 +359,9 @@ struct  intel_engine_cs {
 	struct intel_context *last_context;
 
 	struct intel_ring_hangcheck hangcheck;
+
+	/* Saved head value to be restored after reset */
+	u32 saved_head;
 
 	struct {
 		struct drm_i915_gem_object *obj;
@@ -450,6 +505,15 @@ int __intel_ring_space(int head, int tail, int size);
 void intel_ring_update_space(struct intel_ringbuffer *ringbuf);
 int intel_ring_space(struct intel_ringbuffer *ringbuf);
 bool intel_ring_stopped(struct intel_engine_cs *ring);
+
+void intel_gpu_engine_reset_resample(struct intel_engine_cs *ring,
+		struct drm_i915_gem_request *req);
+int intel_ring_disable(struct intel_engine_cs *ring);
+int intel_ring_enable(struct intel_engine_cs *ring);
+int intel_ring_save(struct intel_engine_cs *ring,
+		struct drm_i915_gem_request *req, bool force_advance);
+int intel_ring_restore(struct intel_engine_cs *ring,
+		struct drm_i915_gem_request *req);
 
 int __must_check intel_ring_idle(struct intel_engine_cs *ring);
 void intel_ring_init_seqno(struct intel_engine_cs *ring, u32 seqno);
