@@ -1352,6 +1352,8 @@ static int i915_hangcheck_info(struct seq_file *m, void *unused)
 	} else
 		seq_printf(m, "Hangcheck inactive\n");
 
+	seq_printf(m, "Full GPU resets = %u\n", i915_reset_count(&dev_priv->gpu_error));
+
 	for_each_ring(ring, dev_priv, i) {
 		seq_printf(m, "%s:\n", ring->name);
 		seq_printf(m, "\tseqno = %x [current %x]\n",
@@ -1363,6 +1365,12 @@ static int i915_hangcheck_info(struct seq_file *m, void *unused)
 			   (long long)ring->hangcheck.max_acthd);
 		seq_printf(m, "\tscore = %d\n", ring->hangcheck.score);
 		seq_printf(m, "\taction = %d\n", ring->hangcheck.action);
+		seq_printf(m, "\tengine resets = %u\n",
+			ring->hangcheck.reset_count);
+		seq_printf(m, "\tengine hang detections = %u\n",
+			ring->hangcheck.tdr_count);
+		seq_printf(m, "\tengine watchdog timeout detections = %u\n",
+			ring->hangcheck.watchdog_count);
 	}
 
 	return 0;
@@ -4568,11 +4576,48 @@ i915_wedged_get(void *data, u64 *val)
 	return 0;
 }
 
+static const char *ringid_to_str(enum intel_ring_id ring_id)
+{
+	switch (ring_id) {
+	case RCS:
+		return "RCS";
+	case VCS:
+		return "VCS";
+	case BCS:
+		return "BCS";
+	case VECS:
+		return "VECS";
+	case VCS2:
+		return "VCS2";
+	}
+
+	return "unknown";
+}
+
 static int
 i915_wedged_set(void *data, u64 val)
 {
 	struct drm_device *dev = data;
 	struct drm_i915_private *dev_priv = dev->dev_private;
+	struct intel_engine_cs *engine;
+	u32 i;
+#define ENGINE_MSGLEN 64
+	char msg[ENGINE_MSGLEN];
+
+	/*
+	 * Val contains the engine flag mask of engines to be reset.
+	 *
+	 * * Full GPU reset is caused by passing val == 0x0
+	 *
+	 * * Any combination of engine hangs is caused by setting up val as a
+	 *   mask with the following bits set for each engine to be hung:
+	 *
+	 *	Bit 0: RCS engine
+	 *	Bit 1: VCS engine
+	 *	Bit 2: BCS engine
+	 *	Bit 3: VECS engine
+	 *	Bit 4: VCS2 engine (if available)
+	 */
 
 	/*
 	 * There is no safeguard against this debugfs entry colliding
@@ -4581,14 +4626,36 @@ i915_wedged_set(void *data, u64 val)
 	 * test harness is responsible enough not to inject gpu hangs
 	 * while it is writing to 'i915_wedged'
 	 */
-
-	if (i915_reset_in_progress(&dev_priv->gpu_error))
+	if (i915_gem_check_wedge(dev_priv, NULL, true))
 		return -EAGAIN;
 
 	intel_runtime_pm_get(dev_priv);
 
-	i915_handle_error(dev, 0x0, false, val,
-			  "Manually setting wedged to %llu", val);
+	memset(msg, 0, sizeof(msg));
+
+	if (val) {
+		scnprintf(msg, sizeof(msg), "Manual reset:");
+
+		/* Assemble message string */
+		for_each_ring(engine, dev_priv, i)
+			if (intel_ring_flag(engine) & val) {
+				DRM_INFO("Manual reset: %s\n", engine->name);
+
+				scnprintf(msg, sizeof(msg),
+					  "%s [%s]",
+					  msg,
+					  ringid_to_str(i));
+			}
+
+	} else {
+		scnprintf(msg, sizeof(msg), "Manual global reset");
+	}
+
+	i915_handle_error(dev,
+			  val,
+			  false,
+			  true,
+			  msg);
 
 	intel_runtime_pm_put(dev_priv);
 
