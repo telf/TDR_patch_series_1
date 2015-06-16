@@ -1235,7 +1235,6 @@ int __i915_wait_request(struct drm_i915_gem_request *req,
 	unsigned long timeout_expire;
 	s64 before, now;
 	int ret;
-	int reset_in_progress = 0;
 
 	WARN(!intel_irqs_enabled(dev_priv), "IRQs disabled");
 
@@ -1252,7 +1251,7 @@ int __i915_wait_request(struct drm_i915_gem_request *req,
 		gen6_rps_boost(dev_priv, rps, req->emitted_jiffies);
 
 	/* Record current time in case interrupted by signal, or wedged */
-	trace_i915_gem_request_wait_begin(req);
+	trace_i915_gem_request_wait_begin(req, is_locked);
 	before = ktime_get_raw_ns();
 
 	/* Optimistic spin for the next jiffie before touching IRQs */
@@ -1267,24 +1266,85 @@ int __i915_wait_request(struct drm_i915_gem_request *req,
 
 	for (;;) {
 		struct timer_list timer;
+		bool full_gpu_reset_completed_unlocked = false;
+		bool reset_in_progress_locked = false;
 
 		prepare_to_wait(&ring->irq_queue, &wait,
 				interruptible ? TASK_INTERRUPTIBLE : TASK_UNINTERRUPTIBLE);
 
-		/* We need to check whether any gpu reset happened in between
-		 * the caller grabbing the seqno and now ... */
-		reset_in_progress =
-			i915_gem_check_wedge(ring->dev->dev_private, NULL, interruptible);
+		/*
+		 * Rules for waiting with/without struct_mutex held during
+		 * asynchronous TDR hang detection/recovery:
+		 *
+		 * ("reset in progress" = TDR has detected a hang, hang
+		 * recovery may or may not have commenced)
+		 *
+		 * 1. Is the driver terminally wedged? If so, return -EIO since
+		 *    there is no point in having the caller retry - the driver
+		 *    is irrecoverably stuck.
+		 *
+		 * 2. Is this thread holding the struct_mutex and is any of the
+		 *    following true?
+		 *
+		 *	a) Is any kind of reset in progress?
+		 *	b) Has a full GPU reset happened while this thread were
+		 *	   sleeping?
+		 *
+		 *    If so:
+		 *	Return -EAGAIN. The caller should interpret this as:
+		 *	Release struct_mutex, try to acquire struct_mutex
+		 *	(through i915_mutex_lock_interruptible(), which will
+		 *	fail as long as any reset is in progress) and retry the
+		 *	call to __i915_wait_request(), which hopefully will go
+		 *	better as soon as the hang has been resolved.
+		 *
+		 * 3. Is this thread not holding the struct_mutex and has a
+		 *    full GPU reset completed? (that is, the reset count has
+		 *    changed but there is currenly no full GPU reset in
+		 *    progress?)
+		 *
+		 *    If so:
+		 *	Return 0. Since the request has been purged there is no
+		 *	requests left to wait for. Just go home.
+		 *
+		 * 4. Is this thread not holding the struct_mutex and is any
+		 *    kind of reset in progress?
+		 *
+		 *    If so:
+		 *	This thread may keep on waiting.
+		 */
 
-		if ((reset_counter != atomic_read(&dev_priv->gpu_error.reset_counter)) ||
-		     reset_in_progress) {
+		if (i915_terminally_wedged(&dev_priv->gpu_error)) {
+			ret = -EIO;
+			break;
+		}
 
-			/* ... but upgrade the -EAGAIN to an -EIO if the gpu
-			 * is truely gone. */
-			if (reset_in_progress)
-				ret = reset_in_progress;
-			else
-				ret = -EAGAIN;
+		reset_in_progress_locked =
+			(((i915_gem_check_wedge(ring->dev->dev_private, NULL, interruptible)) ||
+			  (reset_counter != atomic_read(&dev_priv->gpu_error.reset_counter))) &&
+			  is_locked);
+
+		if (reset_in_progress_locked) {
+			/*
+			 * If the caller is holding the struct_mutex throw them
+			 * out since TDR needs access to it.
+			 */
+			ret = -EAGAIN;
+			break;
+		}
+
+		full_gpu_reset_completed_unlocked =
+			(((reset_counter != atomic_read(&dev_priv->gpu_error.reset_counter)) &&
+			(!i915_reset_in_progress(&dev_priv->gpu_error))));
+
+		if (full_gpu_reset_completed_unlocked) {
+			/*
+			 * Full GPU reset without holding the struct_mutex has
+			 * completed - just return. If recovery is still in
+			 * progress the thread will keep on sleeping until
+			 * recovery is complete.
+			 */
+			ret = 0;
 			break;
 		}
 
