@@ -4128,6 +4128,482 @@ int num_ioctls;</synopsis>
       </sect2>
     </sect1>
 
+    <!--
+	TODO:
+	Create sections with no subsection listing. Deal with subsection
+	references as they appear in the text.
+
+	How do we create inline references to functions with DocBook tags?
+	If you want to refer to a function it would be nice if you could tag
+	the function name so that the reader can click the tag while reading
+	and get straight to the DocBook page on that function.
+    -->
+
+    <sect1>
+    <title>GPU hang management</title>
+    <para>
+    There are two sides to handling GPU hangs: <link linkend='detection'
+    endterm="detection.title"/> and <link linkend='recovery'
+    endterm="recovery.title"/>. In this section we will discuss how the driver
+    detect hangs and what it can do to recover from them.
+    </para>
+
+    <sect2 id='detection'>
+    <title id='detection.title'>Detection</title>
+    <para>
+    There is no theoretically sound definition of what a GPU hang actually is,
+    only assumptions based on empirical observations. One such observation is
+    that if a batch buffer takes more than a certain amount of time to finish
+    then we would assume that it's hung. However, one problem with that
+    assumption is that the execution might be ongoing inside the batch buffer.
+    In fact, it's easy to determine whether or not execution is progressing
+    within a batch buffer. If taking that into account we could create a more
+    refined hang detection algorithm. Unfortunately, there is then the
+    complication that the execution might be stuck in a never-ending loop which
+    keeps execution busy for an unbounded amount of time. These are all
+    practical problems that we need to deal with when detecting a hang and
+    whatever hang detection algorithm we come up with will have a certain
+    probability of false positives.
+    </para>
+    <para>
+    The i915 driver currently supports two forms of hang
+    detection:
+    <orderedlist>
+    <listitem>
+    <link linkend='periodic_hang_checking' endterm="periodic_hang_checking.title"/>
+    </listitem>
+    <listitem>
+    <link linkend='watchdog' endterm="watchdog.title"/>
+    </listitem>
+    </orderedlist>
+    </para>
+
+    <sect3 id='periodic_hang_checking'>
+    <title id='periodic_hang_checking.title'>Periodic Hang Checking</title>
+    <para>
+    The periodic hang checker is a work queue that keeps running in the
+    background as long as there is work outstanding that is pending execution.
+    i915_hangcheck_elapsed() implements the work function of the queue and is
+    executed at every hang checker invocation.
+    </para>
+
+    <para>
+    While being scheduled the hang checker keeps track of a hang score for each
+    individual engine. The hang score is an indication of what degree of
+    severity a hang has reached for a certain engine. The higher the score gets
+    the more radical forms of intervention are employed to force execution to
+    resume.
+    </para>
+
+    <para>
+    The hang checker is scheduled from two places:
+    </para>
+
+    <orderedlist>
+    <listitem>
+    __i915_add_request(), after a new request has been added and is pending submission.
+    </listitem>
+
+    <listitem>
+    i915_hangcheck_elapsed() itself, if work is still pending for any GPU
+    engine the hang checker is rescheduled.
+    </listitem>
+
+    </orderedlist>
+    <para>
+    The periodic hang checker keeps track of the sequence number
+    progression of the currently executing requests on every GPU engine. If
+    they keep progressing in between every hang checker invocation this is
+    interpreted as the engine being active, the hang score is cleared and and
+    no intervention is made. If the sequence number has stalled for one or more
+    engines in between two hang checks that is an indication of one of two
+    things:
+    </para>
+
+    <orderedlist>
+    <listitem>
+    There is no more work pending on the given engine. If there are no
+    threads waiting for request completion this is an indication that no more
+    hang checking is necessary and the hang checker is not rescheduled. If
+    there is someone waiting for request completion the hang checker is
+    rescheduled and the hang score is continually incremented.
+    </listitem>
+
+    <listitem>
+    <para>The given engine is truly hung. In this case a number of hardware
+    state checks are made to determine what the most suitable course of action
+    is and a corresponding hang score incrementation is made to reflect the
+    current hang severity.</para>
+    </listitem>
+    </orderedlist>
+
+    <para>
+    If the hang score of any engine reaches the hung threshold hang recovery is
+    scheduled by calling i915_handle_error() with a engine flag mask containing
+    the bits representing all currently hung engines.
+    </para>
+
+
+    <sect4>
+    <title>Context Submission State Consistency Checking</title>
+
+    <para>
+    On top of this there is the context submission status consistency pre-check
+    in the hang checker that keeps track of driver/HW consistency. The
+    underlying problem that this pre-check is trying to solve is the fact that
+    on some occasions the driver does not receive the proper context event
+    interrupt upon context state changes. Specifically, this has been observed
+    following the completion of engine reset and the subsequent resubmission of
+    the fixed-up context. At this point the engine hang is unblocked and the
+    context completes and the hardware marks the context as complete in the
+    context status buffer (CSB) for the given engine. However, the interrupt
+    that would normally signal this to the driver is lost. What this means to
+    the driver is that it gets stuck waiting for context completion on the
+    given engine until reboot, stalling all further submissions to the engine
+    ELSP.
+    </para>
+
+    <para>
+    The way to detect this is to check for inconsistencies between the context
+    submission state in the hardware as well as in the driver. What this means
+    is that the EXECLIST_STATUS register has to be checked for every engine.
+    From this register the ID of the currently running context can be extracted
+    as well as information about whether or not the engine is idle or not. This
+    information can then be compared against the current state of the execlist
+    queue for the given engine. If the hardware is idle but the driver has
+    pending contexts in the execlist queue for a prolonged period of time then
+    it's safe to assume that the driver/HW state is inconsistent.
+    </para>
+
+    <para>
+    The way driver/HW state inconsistencies are rectified is by faking the
+    presumably lost context event interrupts simply by calling the execlist
+    interrupt handler manually.
+    </para>
+
+    <para>
+    What this means to the periodic hang checker is the following:
+    </para>
+
+    <orderedlist>
+    <listitem>
+    <para>
+    State consistency checking happens at the start of the hang check
+    procedure. If an inconsistency has been detected enough times (more
+    detections than the threshold level of I915_FAKED_CONTEXT_IRQ_THRESHOLD)
+    the hang checker will fake a context event interrupt. If there are
+    outstanding, unprocessed context events in the CSB buffer these will be
+    acted upon.
+    </para>
+    </listitem>
+
+    <listitem>
+    <para>
+    As long as the driver/HW state has been determined to be inconsistent the
+    error handler will not be called. The reason for this is that the engine
+    recovery mode, which is the hang recovery mode that the driver prefers, is
+    not effective if context submissions does not work. If the driver/HW state
+    is inconsistent it might mean that the hardware is currently executing (and
+    might be hung in) a completely different context than the driver expects, which would lead to
+    unexpected pre-emptions, which might mean that trying to resubmit the
+    context that the driver has identified as hung might make the situation
+    worse. Therefore, before any recovery is scheduled the driver/HW state must
+    be confirmed as consistent and stable.
+    </para>
+    </listitem>
+
+    <listitem>
+    <para>
+    If any inconsistent driver/HW states persist regardless of any attempts to
+    rectify the situation there is a final fall-back: In case the hang score on
+    any engine reaches twice that of the normal hang threshold the error
+    handler is called with no engine mask populated, meaning that a full GPU
+    reset is forced. Going for a full GPU reset in this case makes sense since
+    there are two problems that need fixing: 1) <emphasis role="bold">The GPU
+    is hung</emphasis> and 2) <emphasis role="bold">The driver/HW state is
+    inconsistent</emphasis>. The full GPU reset solves both of these problems
+    and does not require the driver/HW state to be consistent to begin with so
+    its a sensible choice in this situation.
+    </para>
+    </listitem>
+
+    </orderedlist>
+
+    </sect4>
+    </sect3>
+
+    <sect3 id='watchdog'>
+    <title id='watchdog.title'>Watchdog Timeout</title>
+    <para>
+    Unlike the <link linkend='periodic_hang_checker'>periodic hang
+    checker</link> Watchdog Timeout is a mode of hang detection that relies on
+    the GPU hardware to notify the driver in the event of a hang. Another
+    dissimilarity is that this mode does not target every engine at all times
+    but rather targets individual batch buffers that have been selected by the
+    submitting application. The way this works is that a submitter can opt-in
+    to use Watchdog Timeout for a particular batch buffer is by setting the
+    Watchdog Timeout enablement flag for that batch buffer. By doing so the
+    driver will emit instructions in the ring buffer before the batch buffer
+    start instruction to enable the Watchdog HW timer and afterwards to cancel
+    the same timer. The purpose of this is to keep track of how long the
+    execution stays inside the batch buffer once the execution reaches that
+    point. If the execution takes to long to clear the batch buffer and the
+    preset Watchdog Timer Threshold elapses the GPU hardware will fire a
+    Watchdog Timeout interrupt to the driver, which is interpreted as current
+    batch buffer for the given engine being hung.  Thus, hang detection in this
+    case is purely interrupt-driven and the driver is free to do other things.
+    </para>
+
+    <para>
+    Once the GT interrupt handler receives the Watchdog Timeout interrupt it
+    then proceeds by making a direct call to i915_handle_error() with
+    information about which engine is hung and by setting the dedicated
+    watchdog priority flag that allows the error handler to circumvent the
+    normal hang promotion logic that applies to hang detections originating
+    from the periodic hang checker.
+    </para>
+
+    <para>
+    In order to enable this Watchdog Timeout for a particular batch buffer
+    userland libDRM has to enable the corresponding bit contained in
+    I915_EXEC_ENABLE_WATCHDOG in the batch buffer flag bitmask. This feature is
+    disabled by default and therefore it operates purely on an opt-in basis
+    from userland's point of view.
+    </para>
+
+    </sect3>
+
+    </sect2>
+
+    <sect2 id='recovery'>
+    <title id='recovery.title'>Recovery</title>
+    <para>
+    Once a hang has been detected, either through periodic hang checking or
+    Watchdog Timeout, the error handler (i915_handle_error) takes over and
+    decices what to do from there on. Generally speaking there are two modes of
+    hang recovery that the error handler can choose from:
+
+    <orderedlist>
+    <listitem>
+    <link linkend='engine_reset' endterm="engine_reset.title"/>
+    </listitem>
+    <listitem>
+    <link linkend='GPU_reset' endterm="GPU_reset.title"/>
+    </listitem>
+    </orderedlist>
+
+    Exactly what recovery mode the hang is promoted to depends on a number of factors:
+    </para>
+
+    <literallayout></literallayout>
+    <itemizedlist>
+    <listitem>
+    <para>
+    <emphasis role="bold">
+    Did the caller say that a hang had been detected but did not specifically ask for engine reset?
+    </emphasis>
+    If the wedged parameter is set in the call to i915_handle_error() but the
+    engine_mask parameter is set to 0 it means that we need to do some kind of
+    hang recovery but no engine is specified. In that case the outcome will
+    always be an attempt to do a GPU reset.
+    </para>
+    </listitem>
+
+    <listitem>
+    <literallayout></literallayout>
+    <para>
+    <emphasis role="bold">
+    Did the caller say that a hang had been detected and specify at least one hung engine?
+    </emphasis>
+    If one or more engines have been specified as hung the first attempt will
+    always be to do an engine reset of those hung engines. There are two
+    reasons why an GPU reset would be carried out instead of a simple engine
+    reset:
+    </para>
+    <orderedlist>
+
+    <listitem>
+    <para>
+    An engine reset was carried out on the same engine too recently. What
+    constitutes "too recent" is determined by the i915 module parameter
+    gpu_reset_promotion_time. If two engine resets were attempted within the
+    time window defined by this module parameter it is decided that the
+    previous engine reset was ineffective and therefore there is no point in
+    trying another one. Thus, a full GPU reset will be done instead.
+    </para>
+    </listitem>
+
+    <listitem>
+    <para>
+    An engine reset was carried out but failed. In this case the hang recovery
+    path (i915_error_work_func) would go straight from the failed engine reset
+    attempt (i915_reset_engine call) to a full GPU reset without delay.
+    </para>
+    </listitem>
+
+    </orderedlist>
+    </listitem>
+
+    <listitem>
+    <literallayout></literallayout>
+    <literallayout></literallayout>
+    <para>
+    <emphasis role="bold">
+    Did the Watchdog Timeout detect the hang?
+    </emphasis>
+    In case of the Watchdog Timeout calling the error handler the dedicated
+    watchdog parameter will be set and this forces the error handler to only
+    consider engine reset and not full GPU reset. We will only promote to full
+    GPU reset if the driver itself, based on its own hang detection mechanism,
+    has detected a persisting hang that will not be resolved by an engine hang.
+    Watchdog Timeout is user-controlled and is therefore not trusted the same
+    way.
+    </para>
+    <literallayout></literallayout>
+    </listitem>
+    </itemizedlist>
+
+    <para>
+    When the error handler reaches a decision of what hang recovery mode to use
+    it sets up the corresponding reset in progress flag. There is one main
+    reset in progress flag for GPU resets as well as one dedicated reset in
+    progress flag in each hangcheck struct for each engine. After that the
+    error handler schedules the actual hang recovery work queue, which ends up
+    in i915_error_work_func, which is the function that grabs all necessary
+    locks and actually calls the main hang recovery functions. For all engines
+    that have their respective error in progress flags the <link
+    linkend='engine_reset' endterm="engine_reset.title">engine reset
+    path</link> is taken for each engine in sequence. If the GPU reset in
+    progress flag is set no attempts at carrying out engine resets are made and
+    instead the legacy <link linkend='GPU_reset' endterm="GPU_reset.title">full
+    GPU reset path</link> is taken.
+    </para>
+
+    <sect3 id='engine_reset'>
+    <title id='engine_reset.title'>Engine Reset</title>
+    <para>
+    The engine reset path is implemented in i915_reset_engine and the following
+    is a summary of how that function operates:
+
+    <orderedlist>
+    <listitem>
+    <para>
+    Get currently running context and check context submission status
+    consistency. If the currently running (hung) context is in an inconsistent
+    state there is really no reason why the execution should be at this point
+    since the hang checker does a consistency check before scheduling hang
+    recovery unless the state has changed since hang recovery was scheduled, in
+    which case the engine is not truly hung. If so, do early exit.
+    </para>
+    </listitem>
+
+    <listitem>
+    <para>
+    Force engine to idle and save the current context image. On gen8+ this is
+    done by setting the reset request bit in the reset control register. On
+    gen7 and earlier gens the MI_MODE register in combination with the ring
+    control register has to be used to disable the engine.
+    </para>
+    </listitem>
+
+    <listitem>
+    <para>
+    Save the head MMIO register value and nudge it to the following valid
+    instruction in the ring buffer following the batch buffer start instruction
+    of the currently hung batch buffer.
+    </para>
+    </listitem>
+
+    <listitem>
+    <para>
+    Reset engine.
+    </para>
+    </listitem>
+
+    <listitem>
+    <para>
+    Call the init() function for the previously hung engine, which should
+    reapply HW workarounds and carry out other essential state
+    reinitialization.
+    </para>
+    </listitem>
+
+    <listitem>
+    <para>
+    Write the previously nudged head register value to both MMIO and context registers.
+    </para>
+    </listitem>
+
+    <listitem>
+    <para>
+    Submit updated context to ELSP in order to force execution to resume (gen8 only).
+    </para>
+    </listitem>
+
+    <listitem>
+    <para>
+    Clear reset in progress engine flag and wake up all threads waiting for requests to complete.
+    </para>
+    </listitem>
+    </orderedlist>
+
+    <literallayout></literallayout>
+
+    <para>
+    The intended outcome of an engine reset is that the hung batch buffer is
+    dropped by forcing the execution to resume following the batch buffer start
+    instruction in the ring buffer. This should only affect the hung engine and
+    none other. No reinitialization aside from a subset of the state for the
+    hung engine should happen and pending work should be retained requiring no
+    further resubmissions.
+    </para>
+
+    </para>
+    </sect3>
+
+    <sect3 id='GPU_reset'>
+    <title id='GPU_reset.title'>GPU reset</title>
+    <para>
+    Basically the GPU reset function, i915_reset, does 3 things:
+    <literallayout></literallayout>
+
+    <orderedlist>
+    <listitem>
+    <para>
+    Reset GEM.
+    </para>
+    </listitem>
+
+    <listitem>
+    <para>
+    Do the actual GPU reset.
+    </para>
+    </listitem>
+
+    <listitem>
+    <para>
+    Reinitialize the GEM part of the driver, including purging all pending work, reinitialize the engines and ring setup and more.
+    </para>
+    </listitem>
+    </orderedlist>
+
+    <literallayout></literallayout>
+
+    The intended outcome of a GPU reset is that all work, including the hung
+    batch buffer as well as all batch buffers following it, is dropped and the
+    GEM part of the driver is reinitialized following the GPU reset. This means
+    that the driver goes to an idle state together with the hardware and should
+    start over from a state in which it is ready to accept more work and move
+    forwards from there. All pending work will have to be resubmitted by the
+    submitting application.
+
+    </para>
+    </sect3>
+
+    </sect2>
+
+    </sect1>
+
     <sect1>
       <title> Tracing </title>
       <para>

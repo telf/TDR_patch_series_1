@@ -2682,7 +2682,9 @@ static void i915_report_and_clear_eir(struct drm_device *dev)
  *			or if one of the current engine resets fails we fall
  *			back to legacy full GPU reset.
  * @watchdog: 		true = Engine hang detected by hardware watchdog.
+ *
  * @wedged: 		true = Hang detected, invoke hang recovery.
+ *
  * @fmt, ...: 		Error message describing reason for error.
  *
  * Do some basic checking of register state at error time and
@@ -3134,7 +3136,11 @@ ring_stuck(struct intel_engine_cs *ring, u64 acthd)
 	return HANGCHECK_HUNG;
 }
 
-/*
+/**
+ * i915_hangcheck_elapsed - hang checker work function
+ *
+ * @work: Work item containing reference to private DRM struct.
+ *
  * This is called when the chip hasn't reported back with completed
  * batchbuffers in a long time. We keep track per ring seqno progress and
  * if there are no progress, hangcheck score for that ring is increased.
