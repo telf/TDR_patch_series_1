@@ -2368,7 +2368,7 @@ int intel_ring_idle(struct intel_engine_cs *ring)
 	return __i915_wait_request(req,
 				   atomic_read(&to_i915(ring->dev)->gpu_error.reset_counter),
 				   to_i915(ring->dev)->mm.interruptible,
-				   NULL, NULL);
+				   NULL, NULL, true); /* Is the mutex always held by this thread at this point? */
 }
 
 int intel_ring_alloc_request_extras(struct drm_i915_gem_request *request)

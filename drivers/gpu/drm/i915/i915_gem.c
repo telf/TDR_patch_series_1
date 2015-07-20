@@ -1206,6 +1206,8 @@ static int __i915_spin_request(struct drm_i915_gem_request *req)
  * @reset_counter: reset sequence associated with the given request
  * @interruptible: do an interruptible wait (normally yes)
  * @timeout: in - how long to wait (NULL forever); out - how much time remaining
+ * @rps: ...
+ * @is_locked: true = Caller is holding struct_mutex
  *
  * Note: It is of utmost importance that the passed in seqno and reset_counter
  * values have been read by the caller in an smp safe manner. Where read-side
@@ -1221,7 +1223,8 @@ int __i915_wait_request(struct drm_i915_gem_request *req,
 			unsigned reset_counter,
 			bool interruptible,
 			s64 *timeout,
-			struct intel_rps_client *rps)
+			struct intel_rps_client *rps,
+			bool is_locked)
 {
 	struct intel_engine_cs *ring = i915_gem_request_get_ring(req);
 	struct drm_device *dev = ring->dev;
@@ -1455,7 +1458,7 @@ i915_wait_request(struct drm_i915_gem_request *req)
 
 	ret = __i915_wait_request(req,
 				  atomic_read(&dev_priv->gpu_error.reset_counter),
-				  interruptible, NULL, NULL);
+				  interruptible, NULL, NULL, true);
 	if (ret)
 		return ret;
 
@@ -1568,7 +1571,7 @@ i915_gem_object_wait_rendering__nonblocking(struct drm_i915_gem_object *obj,
 	mutex_unlock(&dev->struct_mutex);
 	for (i = 0; ret == 0 && i < n; i++)
 		ret = __i915_wait_request(requests[i], reset_counter, true,
-					  NULL, rps);
+					  NULL, rps, false);
 	mutex_lock(&dev->struct_mutex);
 
 	for (i = 0; i < n; i++) {
@@ -3085,7 +3088,7 @@ i915_gem_wait_ioctl(struct drm_device *dev, void *data, struct drm_file *file)
 		if (ret == 0)
 			ret = __i915_wait_request(req[i], reset_counter, true,
 						  args->timeout_ns > 0 ? &args->timeout_ns : NULL,
-						  file->driver_priv);
+						  file->driver_priv, false);
 		i915_gem_request_unreference__unlocked(req[i]);
 	}
 	return ret;
@@ -3118,7 +3121,8 @@ __i915_gem_object_sync(struct drm_i915_gem_object *obj,
 					  atomic_read(&i915->gpu_error.reset_counter),
 					  i915->mm.interruptible,
 					  NULL,
-					  &i915->rps.semaphores);
+					  &i915->rps.semaphores,
+					  true); /* Is the mutex always held by this thread at this point? */
 		if (ret)
 			return ret;
 
@@ -4077,7 +4081,7 @@ i915_gem_ring_throttle(struct drm_device *dev, struct drm_file *file)
 	if (target == NULL)
 		return 0;
 
-	ret = __i915_wait_request(target, reset_counter, true, NULL, NULL);
+	ret = __i915_wait_request(target, reset_counter, true, NULL, NULL, false);
 	if (ret == 0)
 		queue_delayed_work(dev_priv->wq, &dev_priv->mm.retire_work, 0);
 

@@ -11198,7 +11198,8 @@ static void intel_mmio_flip_work_func(struct work_struct *work)
 		WARN_ON(__i915_wait_request(mmio_flip->req,
 					    mmio_flip->crtc->reset_counter,
 					    false, NULL,
-					    &mmio_flip->i915->rps.mmioflips));
+					    &mmio_flip->i915->rps.mmioflips,
+					    false));
 		i915_gem_request_unreference__unlocked(mmio_flip->req);
 	}
 
