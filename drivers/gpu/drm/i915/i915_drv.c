@@ -896,6 +896,7 @@ int i915_reset(struct drm_device *dev)
 	bool simulated;
 	int ret;
 
+	trace_i915_tdr_gpu_recovery(dev);
 	intel_reset_gt_powersave(dev);
 
 	mutex_lock(&dev->struct_mutex);
@@ -1119,6 +1120,8 @@ int i915_reset_engine(struct intel_engine_cs *engine)
 	int err_ret = 0;
 
 	WARN_ON(!mutex_is_locked(&dev->struct_mutex));
+
+	trace_i915_tdr_engine_recovery(engine);
 
         /* Take wake lock to prevent power saving mode */
 	intel_uncore_forcewake_get(dev_priv, FORCEWAKE_ALL);

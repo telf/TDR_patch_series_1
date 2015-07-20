@@ -2285,7 +2285,7 @@ gen8_ring_save(struct intel_engine_cs *ring, struct drm_i915_gem_request *req,
 	struct intel_context *ctx;
 	int ret = 0;
 	int clamp_to_tail = 0;
-	uint32_t head;
+	uint32_t head, old_head;
 	uint32_t tail;
 	uint32_t head_addr;
 	uint32_t tail_addr;
@@ -2300,7 +2300,7 @@ gen8_ring_save(struct intel_engine_cs *ring, struct drm_i915_gem_request *req,
 	 * Read head from MMIO register since it contains the
 	 * most up to date value of head at this point.
 	 */
-	head = I915_READ_HEAD(ring);
+	old_head = head = I915_READ_HEAD(ring);
 
 	/*
 	 * Read tail from the context because the execlist queue
@@ -2356,6 +2356,9 @@ gen8_ring_save(struct intel_engine_cs *ring, struct drm_i915_gem_request *req,
 	head &= ~HEAD_ADDR;
 	head |= (head_addr & HEAD_ADDR);
 	ring->saved_head = head;
+
+	trace_i915_tdr_engine_save(ring, old_head,
+		head, force_advance);
 
 	return 0;
 }
@@ -3264,6 +3267,19 @@ intel_execlists_TDR_get_current_request(struct intel_engine_cs *ring,
 			CONTEXT_SUBMISSION_STATUS_NONE_SUBMITTED;
 	}
 
+	/*
+	 * This may or may not be a sustained inconsistency. Most of the time
+	 * it's only a matter of a transitory inconsistency during context
+	 * submission/completion but if we happen to detect a sustained
+	 * inconsistency then it helps to have more information.
+	 */
+	if (status == CONTEXT_SUBMISSION_STATUS_INCONSISTENT)
+		trace_i915_tdr_inconsistency(ring,
+					     hw_context,
+					     hw_active,
+					     sw_context,
+					     tmpreq);
+
 	if (req)
 		*req = tmpreq;
 
@@ -3328,6 +3344,7 @@ bool intel_execlists_TDR_force_CSB_check(struct drm_i915_private *dev_priv,
 
 	spin_unlock_irqrestore(&engine->execlist_lock, flags);
 
+	trace_i915_tdr_forced_csb_check(engine, !!was_effective);
 	wake_up_all(&engine->irq_queue);
 
 	return !!was_effective;
