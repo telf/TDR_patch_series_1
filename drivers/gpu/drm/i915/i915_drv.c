@@ -917,6 +917,9 @@ int i915_reset(struct drm_device *dev)
 		}
 	}
 
+	/* Clear simulated lost context event interrupts */
+	dev_priv->gpu_error.faked_lost_ctx_event_irq = 0;
+
 	if (i915_stop_ring_allow_warn(dev_priv))
 		pr_notice("drm/i915: Resetting chip after gpu hang\n");
 

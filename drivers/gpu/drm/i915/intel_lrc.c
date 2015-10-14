@@ -700,6 +700,52 @@ static bool execlists_check_remove_request(struct intel_engine_cs *ring,
 }
 
 /**
+ * fake_lost_ctx_event_irq() - Checks for pending faked lost context event IRQs.
+ * @dev_priv: ...
+ * @ring: Engine to check pending faked lost IRQs for.
+ *
+ * Checks the bits in dev_priv->gpu_error.faked_lost_ctx_event_irq corresponding
+ * to the specified engine and updates the bits and returns a value accordingly.
+ *
+ * Return:
+ * 	true: If the current IRQ is to be lost.
+ * 	false: If the current IRQ is to be processed as normal.
+ */
+static inline bool fake_lost_ctx_event_irq(struct drm_i915_private *dev_priv,
+				           struct intel_engine_cs *ring)
+{
+	u32 *faked_lost_irq_mask =
+		&dev_priv->gpu_error.faked_lost_ctx_event_irq;
+
+	/*
+	 * Point out the least significant bit in the nibble of the faked lost
+	 * context event IRQ mask that corresponds to the engine at hand.
+	 */
+	u32 engine_nibble = (ring->id << 2);
+
+	/* Check engine nibble for any pending IRQs to be simulated as lost */
+	if (*faked_lost_irq_mask & (0xf << engine_nibble)) {
+		DRM_INFO("Faked lost interrupt on %s! (%x)\n",
+			ring->name,
+			*faked_lost_irq_mask);
+
+		/*
+		 * Subtract the IRQ that is to be simulated as lost from the
+		 * engine nibble.
+		 */
+		*faked_lost_irq_mask -= (0x1 << engine_nibble);
+
+		DRM_INFO("New fake lost irq mask: %x\n",
+			*faked_lost_irq_mask);
+
+		/* Tell the IRQ handler to simulate lost context event IRQ */
+		return true;
+	}
+
+	return false;
+}
+
+/**
  * intel_lrc_irq_handler() - handle Context Switch interrupts
  * @ring: Engine Command Streamer to handle.
  * @do_lock: Lock execlist spinlock (if false the caller is responsible for this)
@@ -740,6 +786,23 @@ int intel_lrc_irq_handler(struct intel_engine_cs *ring, bool do_lock)
 
 		if (status & GEN8_CTX_STATUS_PREEMPTED) {
 			if (status & GEN8_CTX_STATUS_LITE_RESTORE) {
+				if (fake_lost_ctx_event_irq(dev_priv, ring)) {
+				    /*
+				     * If we want to simulate the loss of a
+				     * context event IRQ (only for such events
+				     * that could affect the execlist queue,
+				     * since this is something that could
+				     * affect the context submission status
+				     * consistency checker) then just exit the
+				     * IRQ handler early with no side-effects!
+				     * We want to pretend like this IRQ never
+				     * happened. The next time the IRQ handler
+				     * is entered for this engine the CSB
+				     * events should remain in the CSB, waiting
+				     * to be processed.
+				     */
+				    goto exit;
+				}
 				if (execlists_check_remove_request(ring, status_id))
 					WARN(1, "Lite Restored request removed from queue\n");
 			} else
@@ -748,6 +811,10 @@ int intel_lrc_irq_handler(struct intel_engine_cs *ring, bool do_lock)
 
 		 if ((status & GEN8_CTX_STATUS_ACTIVE_IDLE) ||
 		     (status & GEN8_CTX_STATUS_ELEMENT_SWITCH)) {
+
+			if (fake_lost_ctx_event_irq(dev_priv, ring))
+			    goto exit;
+
 			if (execlists_check_remove_request(ring, status_id))
 				submit_contexts++;
 		}
@@ -770,6 +837,7 @@ int intel_lrc_irq_handler(struct intel_engine_cs *ring, bool do_lock)
 				 ((u32)ring->next_context_status_buffer &
 				  GEN8_CSB_PTR_MASK) << 8));
 
+exit:
 	if (do_lock)
 		spin_unlock(&ring->execlist_lock);
 

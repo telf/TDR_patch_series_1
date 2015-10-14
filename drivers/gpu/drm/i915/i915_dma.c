@@ -843,6 +843,8 @@ i915_hangcheck_init(struct drm_device *dev)
 	int i;
 	struct drm_i915_private *dev_priv = dev->dev_private;
 
+	dev_priv->gpu_error.faked_lost_ctx_event_irq = 0;
+
 	for (i = 0; i < I915_NUM_RINGS; i++) {
 		struct intel_engine_cs *engine = &dev_priv->ring[i];
 		struct intel_ring_hangcheck *hc = &engine->hangcheck;
