@@ -2355,6 +2355,9 @@ static int logical_render_ring_init(struct drm_device *dev)
 	if (HAS_L3_DPF(dev))
 		ring->irq_keep_mask |= GT_RENDER_L3_PARITY_ERROR_INTERRUPT;
 
+	ring->irq_keep_mask |=
+		(GT_GEN8_RCS_WATCHDOG_INTERRUPT << GEN8_RCS_IRQ_SHIFT);
+
 	if (INTEL_INFO(dev)->gen >= 9)
 		ring->init_hw = gen9_init_render_ring;
 	else
@@ -2415,6 +2418,8 @@ static int logical_bsd_ring_init(struct drm_device *dev)
 		GT_RENDER_USER_INTERRUPT << GEN8_VCS1_IRQ_SHIFT;
 	ring->irq_keep_mask =
 		GT_CONTEXT_SWITCH_INTERRUPT << GEN8_VCS1_IRQ_SHIFT;
+	ring->irq_keep_mask |=
+		(GT_GEN8_VCS_WATCHDOG_INTERRUPT << GEN8_VCS1_IRQ_SHIFT);
 
 	ring->init_hw = gen8_init_common_ring;
 	if (IS_BROXTON(dev) && INTEL_REVID(dev) < BXT_REVID_B0) {
@@ -2449,6 +2454,8 @@ static int logical_bsd2_ring_init(struct drm_device *dev)
 		GT_RENDER_USER_INTERRUPT << GEN8_VCS2_IRQ_SHIFT;
 	ring->irq_keep_mask =
 		GT_CONTEXT_SWITCH_INTERRUPT << GEN8_VCS2_IRQ_SHIFT;
+	ring->irq_keep_mask |=
+		(GT_GEN8_VCS_WATCHDOG_INTERRUPT << GEN8_VCS2_IRQ_SHIFT);
 
 	ring->init_hw = gen8_init_common_ring;
 	ring->get_seqno = gen8_get_seqno;

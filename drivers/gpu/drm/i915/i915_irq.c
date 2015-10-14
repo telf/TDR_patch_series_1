@@ -1305,6 +1305,18 @@ static irqreturn_t gen8_gt_irq_handler(struct drm_i915_private *dev_priv,
 				intel_lrc_irq_handler(&dev_priv->ring[RCS]);
 			if (tmp & (GT_RENDER_USER_INTERRUPT << GEN8_RCS_IRQ_SHIFT))
 				notify_ring(&dev_priv->ring[RCS]);
+			if (tmp & (GT_GEN8_RCS_WATCHDOG_INTERRUPT << GEN8_RCS_IRQ_SHIFT)) {
+				struct intel_engine_cs *ring;
+
+				/* Stop the counter to prevent further interrupts */
+				ring = &dev_priv->ring[RCS];
+				I915_WRITE(RING_CNTR(ring->mmio_base),
+					GEN6_RCS_WATCHDOG_DISABLE);
+
+				ring->hangcheck.watchdog_count++;
+				i915_handle_error(ring->dev, intel_ring_flag(ring), true, true,
+					"Render engine watchdog timed out");
+			}
 
 			if (tmp & (GT_CONTEXT_SWITCH_INTERRUPT << GEN8_BCS_IRQ_SHIFT))
 				intel_lrc_irq_handler(&dev_priv->ring[BCS]);
@@ -1324,11 +1336,35 @@ static irqreturn_t gen8_gt_irq_handler(struct drm_i915_private *dev_priv,
 				intel_lrc_irq_handler(&dev_priv->ring[VCS]);
 			if (tmp & (GT_RENDER_USER_INTERRUPT << GEN8_VCS1_IRQ_SHIFT))
 				notify_ring(&dev_priv->ring[VCS]);
+			if (tmp & (GT_GEN8_VCS_WATCHDOG_INTERRUPT << GEN8_VCS1_IRQ_SHIFT)) {
+				struct intel_engine_cs *ring;
+
+				/* Stop the counter to prevent further interrupts */
+				ring = &dev_priv->ring[VCS];
+				I915_WRITE(RING_CNTR(ring->mmio_base),
+					GEN8_VCS_WATCHDOG_DISABLE);
+
+				ring->hangcheck.watchdog_count++;
+				i915_handle_error(ring->dev, intel_ring_flag(ring), true, true,
+						  "Media engine watchdog timed out");
+			}
 
 			if (tmp & (GT_CONTEXT_SWITCH_INTERRUPT << GEN8_VCS2_IRQ_SHIFT))
 				intel_lrc_irq_handler(&dev_priv->ring[VCS2]);
 			if (tmp & (GT_RENDER_USER_INTERRUPT << GEN8_VCS2_IRQ_SHIFT))
 				notify_ring(&dev_priv->ring[VCS2]);
+			if (tmp & (GT_GEN8_VCS_WATCHDOG_INTERRUPT << GEN8_VCS2_IRQ_SHIFT)) {
+				struct intel_engine_cs *ring;
+
+				/* Stop the counter to prevent further interrupts */
+				ring = &dev_priv->ring[VCS2];
+				I915_WRITE(RING_CNTR(ring->mmio_base),
+					GEN8_VCS_WATCHDOG_DISABLE);
+
+				ring->hangcheck.watchdog_count++;
+				i915_handle_error(ring->dev, intel_ring_flag(ring), true, true,
+						  "Media engine 2 watchdog timed out");
+			}
 		} else
 			DRM_ERROR("The master control interrupt lied (GT1)!\n");
 	}
@@ -3776,11 +3812,14 @@ static void gen8_gt_irq_postinstall(struct drm_i915_private *dev_priv)
 {
 	/* These are interrupts we'll toggle with the ring mask register */
 	uint32_t gt_interrupts[] = {
+		GT_GEN8_RCS_WATCHDOG_INTERRUPT << GEN8_RCS_IRQ_SHIFT |
 		GT_RENDER_USER_INTERRUPT << GEN8_RCS_IRQ_SHIFT |
 			GT_CONTEXT_SWITCH_INTERRUPT << GEN8_RCS_IRQ_SHIFT |
 			GT_RENDER_L3_PARITY_ERROR_INTERRUPT |
 			GT_RENDER_USER_INTERRUPT << GEN8_BCS_IRQ_SHIFT |
 			GT_CONTEXT_SWITCH_INTERRUPT << GEN8_BCS_IRQ_SHIFT,
+		GT_GEN8_VCS_WATCHDOG_INTERRUPT << GEN8_VCS1_IRQ_SHIFT |
+		GT_GEN8_VCS_WATCHDOG_INTERRUPT << GEN8_VCS2_IRQ_SHIFT |
 		GT_RENDER_USER_INTERRUPT << GEN8_VCS1_IRQ_SHIFT |
 			GT_CONTEXT_SWITCH_INTERRUPT << GEN8_VCS1_IRQ_SHIFT |
 			GT_RENDER_USER_INTERRUPT << GEN8_VCS2_IRQ_SHIFT |

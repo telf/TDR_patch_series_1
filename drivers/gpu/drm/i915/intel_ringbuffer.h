@@ -137,6 +137,9 @@ struct intel_ring_hangcheck {
 
 	/* Number of TDR hang detections */
 	u32 tdr_count;
+
+	/* Number of watchdog hang detections for this ring */
+	u32 watchdog_count;
 };
 
 struct intel_ringbuffer {
@@ -362,6 +365,12 @@ struct  intel_engine_cs {
 
 	/* Saved head value to be restored after reset */
 	u32 saved_head;
+
+	/*
+	 * Watchdog timer threshold values
+	 * only RCS, VCS, VCS2 rings have watchdog timeout support
+	 */
+	uint32_t watchdog_threshold;
 
 	struct {
 		struct drm_i915_gem_object *obj;
