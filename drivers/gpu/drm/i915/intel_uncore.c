@@ -1478,32 +1478,50 @@ static int wait_for_register(struct drm_i915_private *dev_priv,
 	return wait_for((I915_READ(reg) & mask) == value, timeout_ms);
 }
 
+static inline int gen8_request_engine_reset(struct intel_engine_cs *engine)
+{
+	struct drm_i915_private *dev_priv = engine->dev->dev_private;
+	int ret = 0;
+
+	I915_WRITE(RING_RESET_CTL(engine->mmio_base),
+		   _MASKED_BIT_ENABLE(RESET_CTL_REQUEST_RESET));
+
+	ret = wait_for_register(dev_priv,
+			      RING_RESET_CTL(engine->mmio_base),
+			      RESET_CTL_READY_TO_RESET,
+			      RESET_CTL_READY_TO_RESET,
+			      700);
+	if (ret)
+		DRM_ERROR("%s: reset request timeout\n", engine->name);
+
+	return ret;
+}
+
+static inline int gen8_unrequest_engine_reset(struct intel_engine_cs *engine)
+{
+	struct drm_i915_private *dev_priv = engine->dev->dev_private;
+
+	I915_WRITE(RING_RESET_CTL(engine->mmio_base),
+		_MASKED_BIT_DISABLE(RESET_CTL_REQUEST_RESET));
+
+	return 0;
+}
+
 static int gen8_do_reset(struct drm_device *dev)
 {
 	struct drm_i915_private *dev_priv = dev->dev_private;
 	struct intel_engine_cs *engine;
 	int i;
 
-	for_each_ring(engine, dev_priv, i) {
-		I915_WRITE(RING_RESET_CTL(engine->mmio_base),
-			   _MASKED_BIT_ENABLE(RESET_CTL_REQUEST_RESET));
-
-		if (wait_for_register(dev_priv,
-				      RING_RESET_CTL(engine->mmio_base),
-				      RESET_CTL_READY_TO_RESET,
-				      RESET_CTL_READY_TO_RESET,
-				      700)) {
-			DRM_ERROR("%s: reset request timeout\n", engine->name);
+	for_each_ring(engine, dev_priv, i)
+		if (gen8_request_engine_reset(engine))
 			goto not_ready;
-		}
-	}
 
 	return gen6_do_reset(dev);
 
 not_ready:
 	for_each_ring(engine, dev_priv, i)
-		I915_WRITE(RING_RESET_CTL(engine->mmio_base),
-			   _MASKED_BIT_DISABLE(RESET_CTL_REQUEST_RESET));
+		gen8_unrequest_engine_reset(engine);
 
 	return -EIO;
 }
