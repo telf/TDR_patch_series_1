@@ -1056,6 +1056,80 @@ int intel_logical_ring_reserve_space(struct drm_i915_gem_request *request)
 	return intel_logical_ring_begin(request, 0);
 }
 
+static int
+gen8_ring_start_watchdog(struct drm_i915_gem_request *req)
+{
+	int ret;
+	struct intel_ringbuffer *ringbuf = req->ringbuf;
+	struct intel_engine_cs *ring = ringbuf->ring;
+
+	ret = intel_logical_ring_begin(req, 10);
+	if (ret)
+		return ret;
+
+	/*
+	 * i915_reg.h includes a warning to place a MI_NOOP
+	 * before a MI_LOAD_REGISTER_IMM
+	 */
+	intel_logical_ring_emit(ringbuf, MI_NOOP);
+	intel_logical_ring_emit(ringbuf, MI_NOOP);
+
+	/* Set counter period */
+	intel_logical_ring_emit(ringbuf, MI_LOAD_REGISTER_IMM(1));
+	intel_logical_ring_emit(ringbuf, RING_THRESH(ring->mmio_base));
+	intel_logical_ring_emit(ringbuf, ring->watchdog_threshold);
+	intel_logical_ring_emit(ringbuf, MI_NOOP);
+
+	/* Start counter */
+	intel_logical_ring_emit(ringbuf, MI_LOAD_REGISTER_IMM(1));
+	intel_logical_ring_emit(ringbuf, RING_CNTR(ring->mmio_base));
+	intel_logical_ring_emit(ringbuf, I915_WATCHDOG_ENABLE);
+	intel_logical_ring_emit(ringbuf, MI_NOOP);
+	intel_logical_ring_advance(ringbuf);
+
+	return 0;
+}
+
+static int
+gen8_ring_stop_watchdog(struct drm_i915_gem_request *req)
+{
+	int ret;
+	struct intel_ringbuffer *ringbuf = req->ringbuf;
+	struct intel_engine_cs *ring = ringbuf->ring;
+
+	ret = intel_logical_ring_begin(req, 6);
+	if (ret)
+		return ret;
+
+	/*
+	 * i915_reg.h includes a warning to place a MI_NOOP
+	 * before a MI_LOAD_REGISTER_IMM
+	 */
+	intel_logical_ring_emit(ringbuf, MI_NOOP);
+	intel_logical_ring_emit(ringbuf, MI_NOOP);
+
+	intel_logical_ring_emit(ringbuf, MI_LOAD_REGISTER_IMM(1));
+	intel_logical_ring_emit(ringbuf, RING_CNTR(ring->mmio_base));
+
+	switch (ring->id) {
+	default:
+		WARN(1, "%s does not support watchdog timeout! " \
+			"Defaulting to render engine.\n", ring->name);
+	case RCS:
+		intel_logical_ring_emit(ringbuf, GEN6_RCS_WATCHDOG_DISABLE);
+		break;
+	case VCS:
+	case VCS2:
+		intel_logical_ring_emit(ringbuf, GEN8_VCS_WATCHDOG_DISABLE);
+		break;
+	}
+
+	intel_logical_ring_emit(ringbuf, MI_NOOP);
+	intel_logical_ring_advance(ringbuf);
+
+	return 0;
+}
+
 /**
  * execlists_submission() - submit a batchbuffer for execution, Execlists style
  * @dev: DRM device.
@@ -1085,6 +1159,12 @@ int intel_execlists_submission(struct i915_execbuffer_params *params,
 	int instp_mode;
 	u32 instp_mask;
 	int ret;
+	bool watchdog_running = false;
+	/*
+	 * NB: Place-holder until watchdog timeout is enabled through DRM
+	 * execbuf interface
+	 */
+	bool enable_watchdog = false;
 
 	instp_mode = args->flags & I915_EXEC_CONSTANTS_MASK;
 	instp_mask = I915_EXEC_CONSTANTS_MASK;
@@ -1121,6 +1201,18 @@ int intel_execlists_submission(struct i915_execbuffer_params *params,
 	if (ret)
 		return ret;
 
+	/* Start watchdog timer */
+	if (enable_watchdog) {
+		if (!intel_ring_supports_watchdog(ring))
+			return -EINVAL;
+
+		ret = gen8_ring_start_watchdog(params->request);
+		if (ret)
+			return ret;
+
+		watchdog_running = true;
+	}
+
 	if (ring == &dev_priv->ring[RCS] &&
 	    instp_mode != dev_priv->relative_constants_mode) {
 		ret = intel_logical_ring_begin(params->request, 4);
@@ -1144,6 +1236,13 @@ int intel_execlists_submission(struct i915_execbuffer_params *params,
 		return ret;
 
 	trace_i915_gem_ring_dispatch(params->request, params->dispatch_flags);
+
+	/* Cancel watchdog timer */
+	if (watchdog_running) {
+		ret = gen8_ring_stop_watchdog(params->request);
+		if (ret)
+			return ret;
+	}
 
 	i915_gem_execbuffer_move_to_active(vmas, params->request);
 	i915_gem_execbuffer_retire_commands(params);
