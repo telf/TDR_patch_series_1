@@ -2755,8 +2755,8 @@ static inline void i915_hangcheck_reinit(struct intel_engine_cs *engine)
 
 /* i915_irq.c */
 void i915_queue_hangcheck(struct drm_device *dev);
-__printf(3, 4)
-void i915_handle_error(struct drm_device *dev, bool wedged,
+__printf(4, 5)
+void i915_handle_error(struct drm_device *dev, u32 engine_mask, bool wedged,
 		       const char *fmt, ...);
 
 extern void intel_irq_init(struct drm_i915_private *dev_priv);

@@ -2649,15 +2649,29 @@ static void i915_report_and_clear_eir(struct drm_device *dev)
 
 /**
  * i915_handle_error - handle a gpu error
- * @dev: drm device
+ * @dev: 		drm device
+ * @engine_mask: 	Bit mask containing the engine flags of all engines
+ *			associated with one or more detected errors.
+ *			May be 0x0.
+ *			If wedged is set to true this implies that one or more
+ *			engine hangs were detected. In this case we will
+ *			attempt to reset all engines that have been detected
+ *			as hung.
+ *			If a previous engine reset was attempted too recently
+ *			or if one of the current engine resets fails we fall
+ *			back to legacy full GPU reset.
+ * @wedged: 		true = Hang detected, invoke hang recovery.
+ * @fmt, ...: 		Error message describing reason for error.
  *
  * Do some basic checking of register state at error time and
  * dump it to the syslog.  Also call i915_capture_error_state() to make
  * sure we get a record and make it available in debugfs.  Fire a uevent
  * so userspace knows something bad happened (should trigger collection
- * of a ring dump etc.).
+ * of a ring dump etc.). If a hang was detected (wedged = true) try to
+ * reset the associated engine. Failing that, try to fall back to legacy
+ * full GPU reset recovery mode.
  */
-void i915_handle_error(struct drm_device *dev, bool wedged,
+void i915_handle_error(struct drm_device *dev, u32 engine_mask, bool wedged,
 		       const char *fmt, ...)
 {
 	struct drm_i915_private *dev_priv = dev->dev_private;
@@ -2665,12 +2679,6 @@ void i915_handle_error(struct drm_device *dev, bool wedged,
 	char error_msg[80];
 
 	struct intel_engine_cs *engine;
-
-	/*
-	 * NB: Placeholder until the hang checker supports
-	 * per-engine hang detection.
-	 */
-	u32 engine_mask = 0;
 
 	va_start(args, fmt);
 	vscnprintf(error_msg, sizeof(error_msg), fmt, args);
@@ -3054,7 +3062,7 @@ ring_stuck(struct intel_engine_cs *ring, u64 acthd)
 	 */
 	tmp = I915_READ_CTL(ring);
 	if (tmp & RING_WAIT) {
-		i915_handle_error(dev, false,
+		i915_handle_error(dev, intel_ring_flag(ring), false,
 				  "Kicking stuck wait on %s",
 				  ring->name);
 		I915_WRITE_CTL(ring, tmp);
@@ -3066,7 +3074,7 @@ ring_stuck(struct intel_engine_cs *ring, u64 acthd)
 		default:
 			return HANGCHECK_HUNG;
 		case 1:
-			i915_handle_error(dev, false,
+			i915_handle_error(dev, intel_ring_flag(ring), false,
 					  "Kicking stuck semaphore on %s",
 					  ring->name);
 			I915_WRITE_CTL(ring, tmp);
@@ -3095,7 +3103,8 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
 	struct drm_device *dev = dev_priv->dev;
 	struct intel_engine_cs *ring;
 	int i;
-	int busy_count = 0, rings_hung = 0;
+	u32 engine_mask = 0;
+	int busy_count = 0;
 	bool stuck[I915_NUM_RINGS] = { 0 };
 #define BUSY 1
 #define KICK 5
@@ -3191,12 +3200,14 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
 			DRM_INFO("%s on %s\n",
 				 stuck[i] ? "stuck" : "no progress",
 				 ring->name);
-			rings_hung++;
+
+			engine_mask |= intel_ring_flag(ring);
+			ring->hangcheck.tdr_count++;
 		}
 	}
 
-	if (rings_hung)
-		return i915_handle_error(dev, true, "Ring hung");
+	if (engine_mask)
+		i915_handle_error(dev, engine_mask, true, "Ring hung (0x%02x)", engine_mask);
 
 	if (busy_count)
 		/* Reset timer case chip hangs without another request
