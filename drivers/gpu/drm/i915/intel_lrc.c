@@ -1160,10 +1160,6 @@ int intel_execlists_submission(struct i915_execbuffer_params *params,
 	u32 instp_mask;
 	int ret;
 	bool watchdog_running = false;
-	/*
-	 * NB: Place-holder until watchdog timeout is enabled through DRM
-	 * execbuf interface
-	 */
 	bool enable_watchdog = false;
 
 	instp_mode = args->flags & I915_EXEC_CONSTANTS_MASK;
@@ -1200,6 +1196,8 @@ int intel_execlists_submission(struct i915_execbuffer_params *params,
 	ret = execlists_move_to_gpu(params->request, vmas);
 	if (ret)
 		return ret;
+
+	enable_watchdog = args->flags & I915_EXEC_ENABLE_WATCHDOG;
 
 	/* Start watchdog timer */
 	if (enable_watchdog) {
