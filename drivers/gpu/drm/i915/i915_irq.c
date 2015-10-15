@@ -2663,6 +2663,7 @@ static void i915_report_and_clear_eir(struct drm_device *dev)
  *			If a previous engine reset was attempted too recently
  *			or if one of the current engine resets fails we fall
  *			back to legacy full GPU reset.
+ * @watchdog: 		true = Engine hang detected by hardware watchdog.
  * @wedged: 		true = Hang detected, invoke hang recovery.
  * @fmt, ...: 		Error message describing reason for error.
  *
@@ -2674,8 +2675,8 @@ static void i915_report_and_clear_eir(struct drm_device *dev)
  * reset the associated engine. Failing that, try to fall back to legacy
  * full GPU reset recovery mode.
  */
-void i915_handle_error(struct drm_device *dev, u32 engine_mask, bool wedged,
-		       const char *fmt, ...)
+void i915_handle_error(struct drm_device *dev, u32 engine_mask,
+                       bool watchdog, bool wedged, const char *fmt, ...)
 {
 	struct drm_i915_private *dev_priv = dev->dev_private;
 	va_list args;
@@ -2713,20 +2714,27 @@ void i915_handle_error(struct drm_device *dev, u32 engine_mask, bool wedged,
 			u32 i;
 
 			for_each_ring(engine, dev_priv, i) {
-				u32 now, last_engine_reset_timediff;
 
 				if (!(intel_ring_flag(engine) & engine_mask))
 					continue;
 
-				/* Measure the time since this engine was last reset */
-				now = get_seconds();
-				last_engine_reset_timediff =
-					now - engine->hangcheck.last_engine_reset_time;
+				if (!watchdog) {
+					/* Measure the time since this engine was last reset */
+					u32 now = get_seconds();
+					u32 last_engine_reset_timediff =
+						now - engine->hangcheck.last_engine_reset_time;
 
-				full_reset = last_engine_reset_timediff <
-					i915.gpu_reset_promotion_time;
+					full_reset = last_engine_reset_timediff <
+						i915.gpu_reset_promotion_time;
 
-				engine->hangcheck.last_engine_reset_time = now;
+					engine->hangcheck.last_engine_reset_time = now;
+				} else {
+					/*
+					 * Watchdog timeout always results
+					 * in engine reset.
+					 */
+					full_reset = false;
+				}
 
 				/*
 				 * This engine was not reset too recently - go ahead
@@ -2737,10 +2745,11 @@ void i915_handle_error(struct drm_device *dev, u32 engine_mask, bool wedged,
 				 * This can still be overridden by a global
 				 * reset e.g. if per-engine reset fails.
 				 */
-				if (!full_reset)
+				if (watchdog || !full_reset)
 					atomic_or(I915_ENGINE_RESET_IN_PROGRESS,
 						&engine->hangcheck.flags);
-				else
+
+				if (full_reset)
 					break;
 
 			} /* for_each_ring */
@@ -3079,7 +3088,7 @@ ring_stuck(struct intel_engine_cs *ring, u64 acthd)
 	 */
 	tmp = I915_READ_CTL(ring);
 	if (tmp & RING_WAIT) {
-		i915_handle_error(dev, intel_ring_flag(ring), false,
+		i915_handle_error(dev, intel_ring_flag(ring), false, false,
 				  "Kicking stuck wait on %s",
 				  ring->name);
 		I915_WRITE_CTL(ring, tmp);
@@ -3091,7 +3100,7 @@ ring_stuck(struct intel_engine_cs *ring, u64 acthd)
 		default:
 			return HANGCHECK_HUNG;
 		case 1:
-			i915_handle_error(dev, intel_ring_flag(ring), false,
+			i915_handle_error(dev, intel_ring_flag(ring), false, false,
 					  "Kicking stuck semaphore on %s",
 					  ring->name);
 			I915_WRITE_CTL(ring, tmp);
@@ -3224,7 +3233,7 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
 	}
 
 	if (engine_mask)
-		i915_handle_error(dev, engine_mask, true, "Ring hung (0x%02x)", engine_mask);
+		i915_handle_error(dev, engine_mask, false, true, "Ring hung (0x%02x)", engine_mask);
 
 	if (busy_count)
 		/* Reset timer case chip hangs without another request
