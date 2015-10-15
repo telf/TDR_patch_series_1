@@ -969,6 +969,120 @@ int i915_reset(struct drm_device *dev)
 }
 
 /**
+ * i915_gem_reset_engine_CSSC_precheck - check/rectify context inconsistency
+ * @dev_priv:	...
+ * @engine: 	The engine whose state is to be checked.
+ * @req: 	Output parameter containing the request most recently submitted
+ * 		to hardware, if any.  May be NULL.
+ * @ret: 	Output parameter containing the error code to be returned to
+ * 		i915_handle_error().
+ *
+ * Before an engine reset can be attempted it is important that the submission
+ * state of the currently running (i.e. hung) context is verified as
+ * consistent. If the context submission state is inconsistent that means that
+ * the context that the driver thinks is running on hardware is in fact not
+ * running at all. It might be that the hardware is idle or is running another
+ * context altogether. The reason why this is important in the case of engine
+ * reset in particular is because at the end of the engine recovery path the
+ * fixed-up context needs to be resubmitted to hardware in order for the
+ * context changes (HEAD register nudged past the hung batch buffer) to take
+ * effect. Context resubmission requires the same context as is resubmitted to
+ * be running on hardware - otherwise we might cause unexpected preemptions or
+ * submit a context to a GPU engine that is idle, which would not make much
+ * sense. (if the engine is idle why does the driver think that the context in
+ * question is hung etc.)
+ * If an inconsistent state like this is detected then a rectification attempt
+ * is made by faking the presumed lost context event interrupt. The outcome of
+ * this attempt is returned back to the per-engine recovery path: If it was
+ * succesful the hang recovery can be aborted early since we now have resolved
+ * the hang this way. If it was not successful then fail the hang recovery and
+ * let the error handler promote to the next level of hang recovery.
+ *
+ * Returns:
+ *	True: 	Work currently in progress, consistent state.
+ *		Proceed with engine reset.
+ *	False: 	No work in progress or work in progress but state irrecoverably
+ *		inconsistent (context event IRQ faking attempted but failed).
+ *		Do not proceed with engine reset.
+ */
+static bool i915_gem_reset_engine_CSSC_precheck(
+		struct drm_i915_private *dev_priv,
+		struct intel_engine_cs *engine,
+		struct drm_i915_gem_request **req,
+		int *ret)
+{
+	bool precheck_ok = true;
+	enum context_submission_status status;
+
+	WARN_ON(!ret);
+
+	*ret = 0;
+
+	status = intel_execlists_TDR_get_current_request(engine, req);
+
+	if (status == CONTEXT_SUBMISSION_STATUS_NONE_SUBMITTED) {
+		/*
+		 * No work in flight, no way to carry out a per-engine hang
+		 * recovery in this state. Just do early exit and forget it
+		 * happened. If this state persists then the error handler will
+		 * be called by the periodic hang checker soon after this and
+		 * at that point the hang will hopefully be promoted to full
+		 * GPU reset, which will take care of it.
+		 */
+		WARN(1, "No work in flight! Aborting recovery on %s\n",
+			engine->name);
+
+		 precheck_ok = false;
+		 *ret = 0;
+
+	} else if (status == CONTEXT_SUBMISSION_STATUS_INCONSISTENT) {
+		if (!intel_execlists_TDR_force_CSB_check(dev_priv, engine)) {
+			DRM_ERROR("Inconsistency rectification on %s unsuccessful!\n",
+				engine->name);
+
+			/*
+			 * Context submission state is inconsistent and
+			 * faking a context event IRQ did not help.
+			 * Fail and promote to higher level of
+			 * recovery!
+			 */
+			precheck_ok = false;
+			*ret = -EINVAL;
+		} else {
+			DRM_INFO("Inconsistency rectification on %s successful!\n",
+				engine->name);
+
+			/*
+			 * Rectifying the inconsistent context
+			 * submission status helped! No reset required,
+			 * just exit and move on!
+			 */
+			 precheck_ok = false;
+			 *ret = 0;
+
+			/*
+			 * Reset the hangcheck state otherwise the hang checker
+			 * will detect another hang immediately. Since the
+			 * forced CSB checker resulted in more work being
+			 * submitted to hardware we know that we are not hung
+			 * anymore so it should be safe to clear any hang
+			 * detections for this engine prior to this point.
+			 */
+			i915_hangcheck_reinit(engine);
+		}
+
+	} else if (status != CONTEXT_SUBMISSION_STATUS_OK) {
+		WARN(1, "Unexpected context submission status (%u) on %s\n",
+			status, engine->name);
+
+		precheck_ok = false;
+		*ret = -EINVAL;
+	}
+
+	return precheck_ok;
+}
+
+/**
  * i915_reset_engine - reset GPU engine after a hang
  * @engine: engine to reset
  *
@@ -1009,28 +1123,22 @@ int i915_reset_engine(struct intel_engine_cs *engine)
 	i915_gem_reset_ring_status(dev_priv, engine);
 
 	if (i915.enable_execlists) {
-		enum context_submission_status status =
-			intel_execlists_TDR_get_current_request(engine, NULL);
-
 		/*
-		 * If the context submission state in hardware is not
-		 * consistent with the the corresponding state in the driver or
-		 * if there for some reason is no current context in the
-		 * process of being submitted then bail out and try again. Do
-		 * not proceed unless we have reliable current context state
-		 * information. The reason why this is important is because
-		 * per-engine hang recovery relies on context resubmission in
-		 * order to force the execution to resume following the hung
-		 * batch buffer. If the hardware is not currently running the
-		 * same context as the driver thinks is hung then anything can
-		 * happen at the point of context resubmission, e.g. unexpected
-		 * preemptions or the previously hung context could be
-		 * submitted when the hardware is idle which makes no sense.
+		 * Check context submission status consistency (CSSC) before
+		 * moving on. If the driver and hardware have different
+		 * opinions about what is going on and this inconsistency
+		 * cannot be rectified then just fail and let TDR escalate to a
+		 * higher form of hang recovery.
 		 */
-		if (status != CONTEXT_SUBMISSION_STATUS_OK) {
-			ret = -EAGAIN;
+		 if (!i915_gem_reset_engine_CSSC_precheck(dev_priv,
+							  engine,
+							  NULL,
+							  &ret)) {
+			DRM_INFO("Aborting hang recovery on %s (%d)\n",
+				engine->name, ret);
+
 			goto reset_engine_error;
-		}
+		 }
 	}
 
 	ret = intel_ring_disable(engine);
@@ -1040,27 +1148,25 @@ int i915_reset_engine(struct intel_engine_cs *engine)
 	}
 
 	if (i915.enable_execlists) {
-		enum context_submission_status status;
-		bool inconsistent;
+		/*
+		 * Get a hold of the currently executing context.
+		 *
+		 * Context submission status consistency is done implicitly so
+		 * we might as well check it post-engine disablement since we
+		 * get that option for free. Also, it's conceivable that the
+		 * context submission state might have changed as part of the
+		 * reset request on gen8+ so it's not completely devoid of
+		 * value to do this.
+		 */
+		 if (!i915_gem_reset_engine_CSSC_precheck(dev_priv,
+							  engine,
+							  &current_request,
+							  &ret)) {
+			DRM_INFO("Aborting hang recovery on %s (%d)\n",
+				engine->name, ret);
 
-		status = intel_execlists_TDR_get_current_request(engine,
-				&current_request);
-
-		inconsistent = (status != CONTEXT_SUBMISSION_STATUS_OK);
-		if (inconsistent) {
-			/*
-			 * If we somehow have reached this point with
-			 * an inconsistent context submission status then
-			 * back out of the previously requested reset and
-			 * retry later.
-			 */
-			WARN(inconsistent,
-			     "Inconsistent context status on %s: %u\n",
-			     engine->name, status);
-
-			ret = -EAGAIN;
 			goto reenable_reset_engine_error;
-		}
+		 }
 	}
 
 	/* Sample the current ring head position */

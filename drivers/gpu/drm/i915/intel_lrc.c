@@ -702,11 +702,15 @@ static bool execlists_check_remove_request(struct intel_engine_cs *ring,
 /**
  * intel_lrc_irq_handler() - handle Context Switch interrupts
  * @ring: Engine Command Streamer to handle.
+ * @do_lock: Lock execlist spinlock (if false the caller is responsible for this)
  *
  * Check the unread Context Status Buffers and manage the submission of new
  * contexts to the ELSP accordingly.
+ *
+ * Return:
+ *      The number of unqueued contexts.
  */
-void intel_lrc_irq_handler(struct intel_engine_cs *ring)
+int intel_lrc_irq_handler(struct intel_engine_cs *ring, bool do_lock)
 {
 	struct drm_i915_private *dev_priv = ring->dev->dev_private;
 	u32 status_pointer;
@@ -716,14 +720,15 @@ void intel_lrc_irq_handler(struct intel_engine_cs *ring)
 	u32 status_id;
 	u32 submit_contexts = 0;
 
+	if (do_lock)
+		spin_lock(&ring->execlist_lock);
+
 	status_pointer = I915_READ(RING_CONTEXT_STATUS_PTR(ring));
 
 	read_pointer = ring->next_context_status_buffer;
 	write_pointer = status_pointer & GEN8_CSB_PTR_MASK;
 	if (read_pointer > write_pointer)
 		write_pointer += GEN8_CSB_ENTRIES;
-
-	spin_lock(&ring->execlist_lock);
 
 	while (read_pointer < write_pointer) {
 		read_pointer++;
@@ -757,8 +762,6 @@ void intel_lrc_irq_handler(struct intel_engine_cs *ring)
 		execlists_context_unqueue(ring, false);
 	}
 
-	spin_unlock(&ring->execlist_lock);
-
 	WARN(submit_contexts > 2, "More than two context complete events?\n");
 	ring->next_context_status_buffer = write_pointer % GEN8_CSB_ENTRIES;
 
@@ -766,6 +769,11 @@ void intel_lrc_irq_handler(struct intel_engine_cs *ring)
 		   _MASKED_FIELD(GEN8_CSB_PTR_MASK << 8,
 				 ((u32)ring->next_context_status_buffer &
 				  GEN8_CSB_PTR_MASK) << 8));
+
+	if (do_lock)
+		spin_unlock(&ring->execlist_lock);
+
+	return submit_contexts;
 }
 
 static int execlists_context_queue(struct drm_i915_gem_request *request)
@@ -1770,6 +1778,7 @@ static int gen8_init_common_ring(struct intel_engine_cs *ring)
 	struct drm_device *dev = ring->dev;
 	struct drm_i915_private *dev_priv = dev->dev_private;
 	u8 next_context_status_buffer_hw;
+	unsigned long flags;
 
 	lrc_setup_hardware_status_page(ring,
 				ring->default_context->engine[ring->id].state);
@@ -1788,6 +1797,7 @@ static int gen8_init_common_ring(struct intel_engine_cs *ring)
 		   _MASKED_BIT_ENABLE(GFX_RUN_LIST_ENABLE));
 	POSTING_READ(RING_MODE_GEN7(ring));
 
+	spin_lock_irqsave(&ring->execlist_lock, flags);
 	/*
 	 * Instead of resetting the Context Status Buffer (CSB) read pointer to
 	 * zero, we need to read the write pointer from hardware and use its
@@ -1810,6 +1820,8 @@ static int gen8_init_common_ring(struct intel_engine_cs *ring)
 		next_context_status_buffer_hw = (GEN8_CSB_ENTRIES - 1);
 
 	ring->next_context_status_buffer = next_context_status_buffer_hw;
+	spin_unlock_irqrestore(&ring->execlist_lock, flags);
+
 	DRM_DEBUG_DRIVER("Execlists enabled for %s\n", ring->name);
 
 	i915_hangcheck_reinit(ring);
@@ -3192,3 +3204,64 @@ intel_execlists_TDR_get_current_request(struct intel_engine_cs *ring,
 
 	return status;
 }
+
+/**
+ * execlists_TDR_force_CSB_check() - rectify inconsistency by faking IRQ
+ * @dev_priv: ...
+ * @engine: engine whose CSB is to be checked.
+ *
+ * Context submission status inconsistencies are caused by lost interrupts that
+ * leave CSB events unprocessed and leave contexts in the execlist queues when
+ * they should really have been removed. These stale contexts block further
+ * submissions to the hardware (all the while the hardware is sitting idle) and
+ * thereby cause a software hang. The way to rectify this is by manually
+ * checking the CSB buffer for outstanding context state transition events and
+ * acting on these. The easiest way of doing this is by simply faking the
+ * presumed lost context event interrupt by manually calling the interrupt
+ * handler. If there are indeed outstanding, unprocessed CSB events then these
+ * will be processed by the faked interrupt call and if one of these events is
+ * some form of context completion event then that will purge a stale context
+ * from the execlist queue and submit a new context to hardware from the queue,
+ * thereby resuming execution.
+ *
+ * Returns:
+ * 	True: Forced CSB check successful, state consistency restored.
+ * 	False: No CSB events found, forced CSB check unsuccessful, failed
+ * 	       trying to restore consistency.
+ */
+bool intel_execlists_TDR_force_CSB_check(struct drm_i915_private *dev_priv,
+					 struct intel_engine_cs *engine)
+{
+	unsigned long flags;
+	bool hw_active;
+	int was_effective;
+
+	hw_active =
+		(I915_READ(RING_EXECLIST_STATUS_LO(engine)) &
+			EXECLIST_STATUS_CURRENT_ACTIVE_ELEMENT_STATUS) ?
+				true : false;
+	if (hw_active) {
+		u32 hw_context;
+
+		hw_context = I915_READ(RING_EXECLIST_STATUS_CTX_ID(engine));
+		WARN(hw_active, "Context (%x) executing on %s - " \
+				"No need for faked IRQ!\n",
+				hw_context, engine->name);
+		return false;
+	}
+
+	spin_lock_irqsave(&engine->execlist_lock, flags);
+
+	WARN(1, "%s: Inconsistent context state - Faking context event IRQ!\n",
+		engine->name);
+
+	if (!(was_effective = intel_lrc_irq_handler(engine, false)))
+		DRM_ERROR("Forced CSB check of %s ineffective!\n", engine->name);
+
+	spin_unlock_irqrestore(&engine->execlist_lock, flags);
+
+	wake_up_all(&engine->irq_queue);
+
+	return !!was_effective;
+}
+
