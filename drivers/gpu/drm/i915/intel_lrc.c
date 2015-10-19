@@ -641,6 +641,16 @@ static void execlists_context_unqueue(struct intel_engine_cs *ring, bool tdr_res
 		}
 	}
 
+	/* Check for a simulated hang request */
+	if (intel_ring_stopped(ring)) {
+		/*
+		 * Mark the request at the head of the queue as submitted but
+		 * dont actually submit it.
+		 */
+		req0->elsp_submitted++;
+		return;
+	}
+
 	WARN_ON(req1 && req1->elsp_submitted && !tdr_resubmission);
 
 	execlists_submit_requests(req0, req1, tdr_resubmission);
@@ -1006,15 +1016,11 @@ static int logical_ring_wait_for_space(struct drm_i915_gem_request *req,
 static void
 intel_logical_ring_advance_and_submit(struct drm_i915_gem_request *request)
 {
-	struct intel_engine_cs *ring = request->ring;
 	struct drm_i915_private *dev_priv = request->i915;
 
 	intel_logical_ring_advance(request->ringbuf);
 
 	request->tail = request->ringbuf->tail;
-
-	if (intel_ring_stopped(ring))
-		return;
 
 	if (dev_priv->guc.execbuf_client)
 		i915_guc_submit(dev_priv->guc.execbuf_client, request);
@@ -3250,7 +3256,17 @@ intel_execlists_TDR_get_current_request(struct intel_engine_cs *ring,
 	}
 
 	if (tmpctx) {
-		status = ((hw_context == sw_context) && hw_active) ?
+		/*
+		 * Check for simuated hang. In this case the head entry in the
+		 * sw execlist queue will not have been submitted to the ELSP, so
+		 * the hw and sw context id's may well disagree, but we still want
+		 * to proceed with hang recovery. So we return OK which allows
+		 * the TDR recovery mechanism to proceed with a ring reset.
+		 */
+		if (intel_ring_stopped(ring))
+			status = CONTEXT_SUBMISSION_STATUS_OK;
+		else
+			status = ((hw_context == sw_context) && hw_active) ?
 				CONTEXT_SUBMISSION_STATUS_OK :
 				CONTEXT_SUBMISSION_STATUS_INCONSISTENT;
 	} else {

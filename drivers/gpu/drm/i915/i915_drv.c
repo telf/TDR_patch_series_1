@@ -1175,6 +1175,16 @@ int i915_reset_engine(struct intel_engine_cs *engine)
 		 }
 	}
 
+	/* Clear any simulated hang flags */
+	if (dev_priv->gpu_error.stop_rings) {
+		DRM_INFO("Simulated gpu hang, reset stop_rings bits %08x\n",
+			(0x1 << engine->id));
+		dev_priv->gpu_error.stop_rings &= ~(0x1 << engine->id);
+		/* if all hangs are cleared, then clear the ALLOW_BAN/ERROR bits */
+		if ((dev_priv->gpu_error.stop_rings & ((1 << I915_NUM_RINGS) - 1)) == 0)
+			dev_priv->gpu_error.stop_rings = 0;
+	}
+
 	/* Sample the current ring head position */
 	head = I915_READ_HEAD(engine) & HEAD_ADDR;
 
