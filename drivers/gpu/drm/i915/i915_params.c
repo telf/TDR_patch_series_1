@@ -35,7 +35,7 @@ struct i915_params i915 __read_mostly = {
 	.enable_fbc = -1,
 	.enable_execlists = -1,
 	.enable_hangcheck = true,
-	.enable_engine_reset = false,
+	.enable_engine_reset = true,
 	.gpu_reset_promotion_time = 10,
 	.enable_ppgtt = -1,
 	.enable_psr = 0,
@@ -115,7 +115,7 @@ MODULE_PARM_DESC(enable_engine_reset,
 	"Enable GPU engine hang recovery mode. Used as a soft, low-impact form "
 	"of hang recovery that targets individual GPU engines rather than the "
 	"entire GPU"
-	"(default: false)");
+	"(default: true)");
 
 module_param_named(gpu_reset_promotion_time,
                i915.gpu_reset_promotion_time, int, 0644);
